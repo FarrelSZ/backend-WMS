@@ -1,0 +1,441 @@
+// WMS: skema awal (T03) - master data dan user/akses, 21 tabel.
+// Diturunkan dari dokumen "WMS: ERD dan Skema Database".
+//
+// Konvensi:
+// - Tabel dan kolom di database snake_case (@@map / @map); di kode TypeScript camelCase.
+// - PK BIGINT UNSIGNED AUTO_INCREMENT. Di JavaScript tipenya bigint, jadi JSON.stringify
+//   perlu penanganan khusus (lihat prisma/README.md).
+// - Jumlah DECIMAL(18,4), waktu DATETIME(3) dalam UTC.
+// - FK default ON DELETE RESTRICT. Pengecualian yang disengaja: tabel penghubung
+//   (role_permissions, user_roles, user_warehouses) dan refresh_tokens (baris anak murni)
+//   memakai CASCADE; refresh_tokens.replaced_by_id memakai SET NULL.
+// - Tabel master punya deleted_at (soft delete). Dokumen transaksi nanti memakai status cancelled.
+// - Nilai enum bisa ditambah lewat migrasi baru; yang di bawah adalah nilai awal.
+// - Tabel fase berikutnya (ledger, inbound, outbound, dst.) ditambahkan lewat migrasi terpisah.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+// ---------------------------------------------------------------------------
+// Enum
+// ---------------------------------------------------------------------------
+
+enum ZoneType {
+  receiving
+  storage
+  picking
+  staging
+  quarantine
+  shipping
+  virtual // untuk lokasi virtual seperti in_transit
+}
+
+enum LocationType {
+  storage
+  pick_face
+  receiving_dock
+  staging
+  quarantine
+  shipping_dock
+  in_transit // virtual: barang dalam perjalanan antar gudang
+}
+
+enum AllocationRule {
+  fifo
+  fefo
+  lifo
+}
+
+enum ReasonCategory {
+  adjustment
+  receiving_variance
+  short_pick
+  return_order
+  count_variance
+}
+
+enum UserStatus {
+  active
+  suspended
+  invited
+}
+
+// ---------------------------------------------------------------------------
+// Master data: gudang dan lokasi
+// ---------------------------------------------------------------------------
+
+model Warehouse {
+  id        BigInt    @id @default(autoincrement()) @db.UnsignedBigInt
+  code      String    @unique @db.VarChar(20)
+  name      String    @db.VarChar(120)
+  isActive  Boolean   @default(true) @map("is_active")
+  createdAt DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.DateTime(3)
+  deletedAt DateTime? @map("deleted_at") @db.DateTime(3)
+
+  zones          Zone[]
+  locations      Location[]
+  skuSettings    SkuWarehouseSetting[]
+  userWarehouses UserWarehouse[]
+  auditLogs      AuditLog[]
+
+  @@map("warehouses")
+}
+
+model Zone {
+  id          BigInt    @id @default(autoincrement()) @db.UnsignedBigInt
+  warehouseId BigInt    @map("warehouse_id") @db.UnsignedBigInt
+  code        String    @db.VarChar(20)
+  name        String    @db.VarChar(120)
+  zoneType    ZoneType  @map("zone_type")
+  isActive    Boolean   @default(true) @map("is_active")
+  createdAt   DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt   DateTime  @updatedAt @map("updated_at") @db.DateTime(3)
+  deletedAt   DateTime? @map("deleted_at") @db.DateTime(3)
+
+  warehouse Warehouse  @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  locations Location[]
+
+  @@unique([warehouseId, code])
+  // Dipakai FK gabungan dari locations agar gudang lokasi selalu sama dengan gudang zonanya.
+  @@unique([id, warehouseId])
+  @@map("zones")
+}
+
+model Location {
+  id           BigInt       @id @default(autoincrement()) @db.UnsignedBigInt
+  warehouseId  BigInt       @map("warehouse_id") @db.UnsignedBigInt
+  zoneId       BigInt       @map("zone_id") @db.UnsignedBigInt
+  code         String       @db.VarChar(40)
+  locationType LocationType @map("location_type")
+  // Koordinat boleh kosong: lokasi virtual dan dock tidak punya lorong/rak.
+  aisle        String?      @db.VarChar(10)
+  rack         String?      @db.VarChar(10)
+  level        String?      @db.VarChar(10)
+  bin          String?      @db.VarChar(10)
+  isActive     Boolean      @default(true) @map("is_active")
+  createdAt    DateTime     @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt    DateTime     @updatedAt @map("updated_at") @db.DateTime(3)
+  deletedAt    DateTime?    @map("deleted_at") @db.DateTime(3)
+
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  // FK gabungan: (zone_id, warehouse_id) harus cocok dengan (id, warehouse_id) milik zona.
+  zone      Zone      @relation(fields: [zoneId, warehouseId], references: [id, warehouseId], onDelete: Restrict)
+
+  @@unique([warehouseId, code])
+  @@index([zoneId])
+  @@map("locations")
+}
+
+// ---------------------------------------------------------------------------
+// Master data: produk
+// ---------------------------------------------------------------------------
+
+model ProductCategory {
+  id        BigInt    @id @default(autoincrement()) @db.UnsignedBigInt
+  parentId  BigInt?   @map("parent_id") @db.UnsignedBigInt
+  name      String    @db.VarChar(120)
+  createdAt DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.DateTime(3)
+  deletedAt DateTime? @map("deleted_at") @db.DateTime(3)
+
+  parent   ProductCategory?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: Restrict)
+  children ProductCategory[] @relation("CategoryTree")
+  skus     Sku[]
+
+  @@index([parentId])
+  @@map("product_categories")
+}
+
+model Uom {
+  id        BigInt    @id @default(autoincrement()) @db.UnsignedBigInt
+  code      String    @unique @db.VarChar(20)
+  name      String    @db.VarChar(60)
+  createdAt DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.DateTime(3)
+  deletedAt DateTime? @map("deleted_at") @db.DateTime(3)
+
+  baseForSkus Sku[]
+  conversions SkuUomConversion[]
+
+  @@map("uoms")
+}
+
+model Sku {
+  id              BigInt         @id @default(autoincrement()) @db.UnsignedBigInt
+  skuCode         String         @unique @map("sku_code") @db.VarChar(64)
+  name            String         @db.VarChar(200)
+  description     String?        @db.Text
+  categoryId      BigInt         @map("category_id") @db.UnsignedBigInt
+  baseUomId       BigInt         @map("base_uom_id") @db.UnsignedBigInt
+  isBatchTracked  Boolean        @default(false) @map("is_batch_tracked")
+  isExpiryTracked Boolean        @default(false) @map("is_expiry_tracked")
+  allocationRule  AllocationRule @default(fifo) @map("allocation_rule")
+  isActive        Boolean        @default(true) @map("is_active")
+  createdAt       DateTime       @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt       DateTime       @updatedAt @map("updated_at") @db.DateTime(3)
+  deletedAt       DateTime?      @map("deleted_at") @db.DateTime(3)
+
+  category          ProductCategory       @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  baseUom           Uom                   @relation(fields: [baseUomId], references: [id], onDelete: Restrict)
+  uomConversions    SkuUomConversion[]
+  warehouseSettings SkuWarehouseSetting[]
+  batches           Batch[]
+
+  @@index([categoryId])
+  @@index([baseUomId])
+  @@map("skus")
+}
+
+model SkuUomConversion {
+  id           BigInt   @id @default(autoincrement()) @db.UnsignedBigInt
+  skuId        BigInt   @map("sku_id") @db.UnsignedBigInt
+  uomId        BigInt   @map("uom_id") @db.UnsignedBigInt
+  factorToBase Decimal  @map("factor_to_base") @db.Decimal(18, 4)
+  // Satu barcode per kombinasi SKU dan satuan; unik di seluruh sistem agar hasil scan tidak ambigu.
+  barcode      String?  @unique @db.VarChar(64)
+  createdAt    DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  sku Sku @relation(fields: [skuId], references: [id], onDelete: Restrict)
+  uom Uom @relation(fields: [uomId], references: [id], onDelete: Restrict)
+
+  @@unique([skuId, uomId])
+  @@index([uomId])
+  @@map("sku_uom_conversions")
+}
+
+model SkuWarehouseSetting {
+  id          BigInt   @id @default(autoincrement()) @db.UnsignedBigInt
+  skuId       BigInt   @map("sku_id") @db.UnsignedBigInt
+  warehouseId BigInt   @map("warehouse_id") @db.UnsignedBigInt
+  minStock    Decimal  @default(0) @map("min_stock") @db.Decimal(18, 4)
+  maxStock    Decimal? @map("max_stock") @db.Decimal(18, 4)
+  createdAt   DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  sku       Sku       @relation(fields: [skuId], references: [id], onDelete: Restrict)
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+
+  @@unique([skuId, warehouseId])
+  @@index([warehouseId])
+  @@map("sku_warehouse_settings")
+}
+
+model Batch {
+  id         BigInt    @id @default(autoincrement()) @db.UnsignedBigInt
+  skuId      BigInt    @map("sku_id") @db.UnsignedBigInt
+  batchNo    String    @map("batch_no") @db.VarChar(64)
+  expiryDate DateTime? @map("expiry_date") @db.Date
+  createdAt  DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt  DateTime  @updatedAt @map("updated_at") @db.DateTime(3)
+
+  sku Sku @relation(fields: [skuId], references: [id], onDelete: Restrict)
+
+  @@unique([skuId, batchNo])
+  // Mendukung pengambilan FEFO: batch tercepat kedaluwarsa per SKU.
+  @@index([skuId, expiryDate])
+  @@map("batches")
+}
+
+// ---------------------------------------------------------------------------
+// Master data: mitra dan kode alasan
+// ---------------------------------------------------------------------------
+
+model Supplier {
+  id          BigInt    @id @default(autoincrement()) @db.UnsignedBigInt
+  code        String    @unique @db.VarChar(30)
+  name        String    @db.VarChar(160)
+  contactName String?   @map("contact_name") @db.VarChar(120)
+  phone       String?   @db.VarChar(30)
+  email       String?   @db.VarChar(255)
+  address     String?   @db.Text
+  isActive    Boolean   @default(true) @map("is_active")
+  createdAt   DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt   DateTime  @updatedAt @map("updated_at") @db.DateTime(3)
+  deletedAt   DateTime? @map("deleted_at") @db.DateTime(3)
+
+  @@map("suppliers")
+}
+
+model Customer {
+  id              BigInt    @id @default(autoincrement()) @db.UnsignedBigInt
+  code            String    @unique @db.VarChar(30)
+  name            String    @db.VarChar(160)
+  phone           String?   @db.VarChar(30)
+  email           String?   @db.VarChar(255)
+  shippingAddress String?   @map("shipping_address") @db.Text
+  isActive        Boolean   @default(true) @map("is_active")
+  createdAt       DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.DateTime(3)
+  deletedAt       DateTime? @map("deleted_at") @db.DateTime(3)
+
+  @@map("customers")
+}
+
+model Carrier {
+  id        BigInt    @id @default(autoincrement()) @db.UnsignedBigInt
+  code      String    @unique @db.VarChar(30)
+  name      String    @db.VarChar(120)
+  isActive  Boolean   @default(true) @map("is_active")
+  createdAt DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.DateTime(3)
+  deletedAt DateTime? @map("deleted_at") @db.DateTime(3)
+
+  @@map("carriers")
+}
+
+model ReasonCode {
+  id               BigInt         @id @default(autoincrement()) @db.UnsignedBigInt
+  code             String         @unique @db.VarChar(40)
+  description      String         @db.VarChar(200)
+  category         ReasonCategory
+  requiresApproval Boolean        @default(false) @map("requires_approval")
+  isActive         Boolean        @default(true) @map("is_active")
+  createdAt        DateTime       @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt        DateTime       @updatedAt @map("updated_at") @db.DateTime(3)
+  deletedAt        DateTime?      @map("deleted_at") @db.DateTime(3)
+
+  @@index([category])
+  @@map("reason_codes")
+}
+
+// ---------------------------------------------------------------------------
+// Users dan roles
+// ---------------------------------------------------------------------------
+
+model User {
+  id               BigInt     @id @default(autoincrement()) @db.UnsignedBigInt
+  email            String     @unique @db.VarChar(255)
+  passwordHash     String     @map("password_hash") @db.VarChar(255)
+  fullName         String     @map("full_name") @db.VarChar(120)
+  status           UserStatus @default(active)
+  failedLoginCount Int        @default(0) @map("failed_login_count")
+  lockedUntil      DateTime?  @map("locked_until") @db.DateTime(3)
+  lastLoginAt      DateTime?  @map("last_login_at") @db.DateTime(3)
+  createdAt        DateTime   @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt        DateTime   @updatedAt @map("updated_at") @db.DateTime(3)
+  deletedAt        DateTime?  @map("deleted_at") @db.DateTime(3)
+
+  roles         UserRole[]
+  warehouses    UserWarehouse[]
+  refreshTokens RefreshToken[]
+  auditLogs     AuditLog[]
+
+  @@map("users")
+}
+
+model Role {
+  id        BigInt   @id @default(autoincrement()) @db.UnsignedBigInt
+  code      String   @unique @db.VarChar(40)
+  name      String   @db.VarChar(80)
+  isSystem  Boolean  @default(false) @map("is_system")
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  permissions RolePermission[]
+  users       UserRole[]
+
+  @@map("roles")
+}
+
+model Permission {
+  id          BigInt   @id @default(autoincrement()) @db.UnsignedBigInt
+  // Format modul:aksi, misalnya inbound:receive atau adjustment:approve.
+  code        String   @unique @db.VarChar(80)
+  module      String   @db.VarChar(40)
+  description String?  @db.VarChar(200)
+  createdAt   DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  roles RolePermission[]
+
+  @@index([module])
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       BigInt @map("role_id") @db.UnsignedBigInt
+  permissionId BigInt @map("permission_id") @db.UnsignedBigInt
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@index([permissionId])
+  @@map("role_permissions")
+}
+
+model UserRole {
+  userId BigInt @map("user_id") @db.UnsignedBigInt
+  roleId BigInt @map("role_id") @db.UnsignedBigInt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+  @@index([roleId])
+  @@map("user_roles")
+}
+
+model UserWarehouse {
+  userId      BigInt @map("user_id") @db.UnsignedBigInt
+  warehouseId BigInt @map("warehouse_id") @db.UnsignedBigInt
+
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+
+  @@id([userId, warehouseId])
+  @@index([warehouseId])
+  @@map("user_warehouses")
+}
+
+model RefreshToken {
+  id           BigInt    @id @default(autoincrement()) @db.UnsignedBigInt
+  userId       BigInt    @map("user_id") @db.UnsignedBigInt
+  // Hanya hash token yang disimpan, bukan token aslinya.
+  tokenHash    String    @unique @map("token_hash") @db.VarChar(128)
+  // Pada rotasi, token lama menunjuk token penggantinya.
+  replacedById BigInt?   @map("replaced_by_id") @db.UnsignedBigInt
+  expiresAt    DateTime  @map("expires_at") @db.DateTime(3)
+  revokedAt    DateTime? @map("revoked_at") @db.DateTime(3)
+  createdAt    DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+
+  user       User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  replacedBy RefreshToken?  @relation("TokenRotation", fields: [replacedById], references: [id], onDelete: SetNull)
+  replaces   RefreshToken[] @relation("TokenRotation")
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([replacedById])
+  @@map("refresh_tokens")
+}
+
+// Hanya ditambah, tidak pernah diubah. Polimorfik: entity_type + entity_id tanpa FK.
+model AuditLog {
+  id          BigInt   @id @default(autoincrement()) @db.UnsignedBigInt
+  userId      BigInt?  @map("user_id") @db.UnsignedBigInt
+  action      String   @db.VarChar(40)
+  entityType  String   @map("entity_type") @db.VarChar(60)
+  entityId    BigInt?  @map("entity_id") @db.UnsignedBigInt
+  warehouseId BigInt?  @map("warehouse_id") @db.UnsignedBigInt
+  beforeJson  Json?    @map("before_json")
+  afterJson   Json?    @map("after_json")
+  requestId   String?  @map("request_id") @db.VarChar(64)
+  createdAt   DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  user      User?      @relation(fields: [userId], references: [id], onDelete: Restrict)
+  warehouse Warehouse? @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+
+  @@index([entityType, entityId])
+  @@index([userId, createdAt])
+  @@index([warehouseId, createdAt])
+  @@index([requestId])
+  @@map("audit_logs")
+}
