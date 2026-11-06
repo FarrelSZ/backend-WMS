@@ -14,7 +14,7 @@ WMS multi-gudang: inbound (PO/ASN, penerimaan, putaway), outbound (alokasi, pick
 - Frontend: Next.js, Redux Toolkit dengan RTK Query (state server lewat RTK Query, slice hanya untuk state UI seperti filter dan sesi scan). Operator memakai PWA (scan barcode lewat kamera atau scanner Bluetooth yang bertingkah seperti keyboard).
 - Backend: Express.js, Prisma 7 dengan adapter `@prisma/adapter-mariadb`, MySQL 8.0.16 atau lebih baru (agar CHECK constraint ditegakkan), zod, pino, helmet, express-rate-limit, `node-cron`.
 - Prisma: pin ke mayor 7 (`prisma@7`, `@prisma/client@7`). Jangan memakai tag `latest`, karena sekarang menunjuk ke 8.0 RC. Prisma 7 berbasis ESM, konfigurasi di `prisma.config.ts`, klien di `src/generated/prisma` (masuk `.gitignore`), dan `datasource` di schema tidak memuat `url`.
-- Auth: JWT access token pendek (usulan 15 menit) dan refresh token berotasi di cookie httpOnly. Hash kata sandi argon2id atau bcrypt (diputuskan di T04).
+- Auth: JWT access token pendek (usulan 15 menit) dan refresh token berotasi di cookie httpOnly. Hash kata sandi memakai modul `crypto` bawaan Node (scrypt; template di panduan T04), bukan argon2 atau bcrypt.
 - Job latar belakang: tabel `jobs` dan `node-cron`. Redis/BullMQ hanya bila volume memaksa.
 - Belum diputuskan, jangan berasumsi: test runner (Vitest atau Jest), layanan email, vendor object storage, vendor hosting.
 
