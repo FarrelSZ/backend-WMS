@@ -3,6 +3,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 export const SECRET: string = process.env.SECRET || "";
+export const INVITE_JWT_SECRET = process.env.INVITE_JWT_SECRET || "";
 export const PORT: number = Number(process.env.PORT) || 3000;
 export const DATABASE_URL: string = process.env.DATABASE_URL || "";
 export const DATABASE_USER: string = process.env.DATABASE_USER || "";
